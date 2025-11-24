@@ -1,0 +1,215 @@
+!pip install pandas numpy scikit-learn torch
+import pandas as pd
+
+# Load your commentary CSV
+df = pd.read_csv("936161_COMMENTARY.csv")
+df = df[['PlayType_description', 'Commentary']].dropna()
+df.head()
+
+# Uninstall existing installations more aggressively
+!pip uninstall -y torch torchvision torchaudio torchtext
+
+
+!pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
+
+# Install torchtext
+!pip install torchtext
+
+# Install other necessary libraries
+!pip install transformers pandas numpy scikit-learn
+
+import re
+import torch
+from sklearn.model_selection import train_test_split
+
+# Simple cleaning function
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    return text
+
+df['PlayType_description'] = df['PlayType_description'].apply(clean_text)
+df['Commentary'] = df['Commentary'].apply(clean_text)
+
+# Tokenize
+from torchtext.vocab import build_vocab_from_iterator
+from torch.utils.data import Dataset, DataLoader
+
+def yield_tokens(data, column):
+    for text in data[column]:
+        yield text.split()
+
+vocab = build_vocab_from_iterator(yield_tokens(df, 'PlayType_description'), specials=["<pad>", "<sos>", "<eos>"])
+vocab.set_default_index(vocab["<pad>"])
+
+# Encoding
+def encode(text):
+    return [vocab["<sos>"]] + [vocab[token] for token in text.split()] + [vocab["<eos>"]]
+
+df['input_ids'] = df['PlayType_description'].apply(encode)
+df['target_ids'] = df['Commentary'].apply(encode)
+
+# Train-test split
+train_data, val_data = train_test_split(df, test_size=0.1, random_state=42)
+
+class CommentaryDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.data.iloc[idx]['input_ids'], dtype=torch.long)
+        y = torch.tensor(self.data.iloc[idx]['target_ids'], dtype=torch.long)
+        return x, y
+
+train_dataset = CommentaryDataset(train_data)
+val_dataset = CommentaryDataset(val_data)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=lambda x: x)
+
+import torch.nn as nn
+
+class EncoderRNN(nn.Module):
+    def __init__(self, input_dim, emb_dim, hid_dim):
+        super(EncoderRNN, self).__init__()
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+        self.rnn = nn.RNN(emb_dim, hid_dim, batch_first=True)
+
+    def forward(self, src):
+        embedded = self.embedding(src)
+        outputs, hidden = self.rnn(embedded)
+        return outputs, hidden
+
+class Attention(nn.Module):
+    def __init__(self, hid_dim):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hid_dim * 2, 1)
+
+    def forward(self, hidden, encoder_outputs):
+        src_len = encoder_outputs.size(1)
+        hidden = hidden.repeat(1, src_len, 1)
+        energy = self.attn(torch.cat((hidden, encoder_outputs), dim=2))
+        attention = torch.softmax(energy.squeeze(2), dim=1)
+        return attention
+
+class DecoderRNN(nn.Module):
+    def __init__(self, output_dim, emb_dim, hid_dim):
+        super(DecoderRNN, self).__init__()
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+        self.rnn = nn.RNN(emb_dim + hid_dim, hid_dim, batch_first=True)
+        self.fc = nn.Linear(hid_dim * 2, output_dim)
+        self.attention = Attention(hid_dim)
+
+    def forward(self, input, hidden, encoder_outputs):
+        input = input.unsqueeze(1)
+        embedded = self.embedding(input)
+        attn_weights = self.attention(hidden.transpose(0, 1), encoder_outputs)
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
+        rnn_input = torch.cat((embedded, context), dim=2)
+        output, hidden = self.rnn(rnn_input, hidden)
+        output = self.fc(torch.cat((output.squeeze(1), context.squeeze(1)), dim=1))
+        return output, hidden
+
+  def train_step(encoder, decoder, data_loader, optimizer, criterion):
+    encoder.train()
+    decoder.train()
+    total_loss = 0
+
+    for batch in data_loader:
+        optimizer.zero_grad()
+        for src, trg in batch:
+            src, trg = src.unsqueeze(0), trg.unsqueeze(0)
+            encoder_outputs, hidden = encoder(src)
+            loss = 0
+            input_token = trg[0, 0]
+
+            for t in range(1, trg.size(1)):
+                output, hidden = decoder(input_token, hidden, encoder_outputs)
+                loss += criterion(output, trg[0, t].unsqueeze(0))
+                input_token = trg[0, t]  # teacher forcing
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() / trg.size(1)
+
+    return total_loss / len(data_loader)
+
+  import torch
+import torch.nn as nn
+
+# Define Encoder
+class Encoder(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.rnn = nn.RNN(hidden_size, hidden_size, batch_first=True)
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        output, hidden = self.rnn(embedded)
+        return output, hidden
+
+# Define Decoder
+class Decoder(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(Decoder, self).__init__()
+        self.embedding = nn.Embedding(output_size, hidden_size)
+        self.rnn = nn.RNN(hidden_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, hidden, encoder_outputs=None):
+        embedded = self.embedding(x)
+        output, hidden = self.rnn(embedded, hidden)
+        prediction = self.fc(output.squeeze(1))
+        return prediction, hidden, None
+
+  def generate(encoder, decoder, src_sentence, max_len=30):
+    encoder.eval()
+    decoder.eval()
+    src_ids = torch.tensor(encode(clean_text(src_sentence))).unsqueeze(0)
+    with torch.no_grad():
+        encoder_outputs, hidden = encoder(src_ids)
+        input_token = torch.tensor([vocab["<sos>"]])
+        outputs = []
+
+        for _ in range(max_len):
+            output, hidden = decoder(input_token, hidden, encoder_outputs)
+            top1 = output.argmax(1).item()
+            if top1 == vocab["<eos>"]:
+                break
+            outputs.append(top1)
+            input_token = torch.tensor([top1])
+
+    return " ".join([vocab.get_itos()[i] for i in outputs])
+
+  # Loop for user-friendly input
+while True:
+    print("\n--- Enter Match Event Details (type 'exit' anytime to quit) ---")
+
+    play_type = input("Play Type (e.g., cover drive, pull shot): ").strip()
+    if play_type.lower() == 'exit':
+        break
+
+    batsman = input("Batsman (e.g., virat kohli): ").strip()
+    if batsman.lower() == 'exit':
+        break
+
+    bowler = input("Bowler (e.g., mitchell starc): ").strip()
+    if bowler.lower() == 'exit':
+        break
+
+    runs = input("Runs scored (e.g., 4, 6, 0): ").strip()
+    if runs.lower() == 'exit':
+        break
+
+    # Construct the input string
+    user_input = f"play type: {play_type} | batsman: {batsman} | bowler: {bowler} | runs: {runs}"
+
+    try:
+        result = generate(encoder, decoder, user_input)
+        print(f"\nGenerated Commentary:\n{result}\n")
+    except Exception as e:
+        print(f"\nError: {e}\nPlease try again with valid inputs.\n")
+
